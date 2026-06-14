@@ -2,18 +2,34 @@
 
 GN-SDE models spatio-temporal crime dynamics across urban regions by combining Graph Neural Networks with Stochastic Differential Equations solved via [`torchsde`](https://github.com/google-research/torchsde).
 
-Datasets: Chicago Beats · Chicago Districts · NYC Precincts
+**Datasets:** Chicago Beats · Chicago Districts · NYC Precincts
+
 ---
+
+## Datasets
+
+| Dataset | Source | Link |
+|---|---|---|
+| NYPD Complaint Data Historic | NYC Open Data | [qgea-i56i](https://data.cityofnewyork.us/Public-Safety/NYPD-Complaint-Data-Historic/qgea-i56i) |
+| NYPD Arrests Data Historic | NYC Open Data | [8h9b-rp9u](https://data.cityofnewyork.us/Public-Safety/NYPD-Arrests-Data-Historic-/8h9b-rp9u) |
+| Chicago Police Beats | Chicago Data Portal | [aerh-rz74](https://data.cityofchicago.org/Public-Safety/Boundaries-Police-Beats-current-/aerh-rz74) |
+| Chicago Crimes 2001-Present | Chicago Data Portal | [ijzp-q8t2](https://data.cityofchicago.org/Public-Safety/Crimes-2001-to-Present/ijzp-q8t2) |
+
+---
+
 ## Installation
 
 ```bash
-python -m venv .venv && source .venv/bin/activate   # Windows: .venv\Scripts\activate
+python -m venv .venv
+.venv\Scripts\activate        # Windows
 pip install -r requirements.txt
 ```
+
 ---
+
 ## Repository Structure
 
-```text
+```
 data/
 ├── raw/
 └── processed/
@@ -23,17 +39,18 @@ src/
 │   ├── build_crime.py
 │   ├── build_arrest.py
 │   └── build_regions_order.py
-└── graph/
-    ├── build_adjsp_chicago_districts.py
-    ├── build_adjsp_chicago_beats.py
-    └── build_adjsp_nyc_precincts.py
-
-model/
-└── gnsde_new32_final_paper.py
-
-train_gnsde.py
+├── graph/
+│   ├── build_adjsp_chicago_districts.py
+│   ├── build_adjsp_chicago_beats.py
+│   └── build_adjsp_nyc_precincts.py
+├── model/
+│   └── gnsde_new32_final_paper.py
+├── train_gnsde.py
+└── train_gnode.py
 ```
+
 ---
+
 ## Data Pipeline
 
 Run in order:
@@ -46,24 +63,22 @@ python src/data/build_regions_order.py    # → data/raw/graph_*_order.csv
 python src/graph/build_adjsp_chicago_districts.py
 python src/graph/build_adjsp_chicago_beats.py
 python src/graph/build_adjsp_nyc_precincts.py
-# → data/processed/*_adjacency_spatial.npy   (spatial / spatial_attn / latent)
-# → data/processed/*_adjacencyfc.npy         (fc baseline)
+# → data/processed/*_adjacency_spatial.npy
+# → data/processed/*_adjacencyfc.npy
 ```
 
 ---
 
 ## Model Variants
 
-All variants use `hidden_dim=32`. Hierarchy comes from inductive bias, not capacity.
+All variants use `hidden_dim=32`.
 
-| Variant        | Description |
-| -------------- | ----------- |
-| `fc`           | Fully-connected baseline |
-| `spatial`      | Spatial smoothing via Tobler `rho` |
+| Variant | Description |
+|---|---|
+| `fc` | Fully-connected baseline |
+| `spatial` | Spatial smoothing via Tobler `rho` |
 | `spatial_attn` | Graph attention with enforcement beta modulator `m_beta` |
-| `latent`       | Latent-memory GN-SDE with `obs_gate` enforcement blending |
-
-The training script selects `adjacencyfc.npy` for `fc` and `adjacency_spatial.npy` for all other variants automatically.
+| `latent` | Latent-memory GN-SDE with `obs_gate` enforcement blending |
 
 ---
 
@@ -86,7 +101,9 @@ Training runs in two phases:
 - **Phase 2 — Huber + NLL calibration.** Best Phase 1 checkpoint reloaded; `log_sigma_pred` unfrozen; drift LR reduced to `LR × 0.1`.
 
 Early stopping is applied in both phases.
+
 ---
+
 ## Inference
 
 After training, 100 MC forward passes are run to estimate predictive uncertainty:
@@ -102,7 +119,7 @@ A 90% prediction interval is calibrated empirically on the validation set.
 ## Outputs
 
 | File | Description |
-| ---- | ----------- |
+|---|---|
 | `data/processed/{DATASET}_{VARIANT}_final_best.pt` | Best model checkpoint |
 | `data/processed/{DATASET}_{VARIANT}_final_predictions.csv` | `month, region_id, C_gnsde, C_std, C_p05, C_p95, split` |
 | `data/processed/{DATASET}_{VARIANT}_final_history.csv` | `epoch, phase, train, val, sigma_pred` |
@@ -118,7 +135,7 @@ Test-set metrics reported after inference: MAE, RMSE, R², sMAPE, Coverage@90%, 
 
 ## Diagnostics
 
-Variant-specific diagnostics are printed after evaluation:
+Variant-specific diagnostics printed after evaluation:
 
 - **`latent`** — `obs_gate` balance, `Corr(L_latent, L_obs)`, per-region `L_latent` variation
 - **`spatial_attn`** — `m_beta` range over time and regions, `rho`, collapse warning
@@ -156,4 +173,3 @@ np.random.seed(42)
 ## License
 
 Released for academic and research purposes.
-
