@@ -1,52 +1,42 @@
-import os
-import math
+import os  #table 1 currected file
 import torch
 import torch.nn as nn
 import numpy as np
 import pandas as pd
 from torchdiffeq import odeint
-from sklearn.metrics import (mean_absolute_error,
-                             mean_squared_error, r2_score)
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from model.gnode_paper import MODEL_MAP
-import time
 
-torch.set_num_threads(os.cpu_count())
-torch.set_float32_matmul_precision("high")
-os.environ["OMP_NUM_THREADS"] = str(os.cpu_count())
-
-# ─── CHANGE THESE 2 LINES ────────────────────────────────────────────
-DATASET = "chicago_beats"
-VARIANT = "spatial_attn"
-# ─────────────────────────────────────────────────────────────────────
+# ─── CHANGE THESE 2 LINES ONLY ──────────────────────────────────────
+DATASET = "nyc_precincts"   # "chicago_beats" | "chicago_districts" | "nyc_precincts"
+VARIANT = "latent"       # "fc" | "spatial" | "spatial_attn" | "latent"
+# ────────────────────────────────────────────────────────────────────
 
 torch.manual_seed(42)
 np.random.seed(42)
 
-ODE_VARIANTS = {"fc", "spatial", "spatial_attn", "latent"}
-SDE_VARIANTS = set()
+print(f"Training GN-ODE  |  dataset={DATASET}  variant={VARIANT}")
 
+# ─────────────────────────────────────────────────────────────────────────────
+# HYPERPARAMETERS — NYC gets gentler LR and more epochs
+# ─────────────────────────────────────────────────────────────────────────────
 HPARAMS = {
-    "chicago_beats"     : dict(lr=3e-4, epochs=200, patience=20,
-                               hidden=16, mem_dim=16, dt=0.1),
-    "chicago_districts" : dict(lr=3e-4, epochs=200, patience=20,
-                               hidden=16, mem_dim=16, dt=0.1),
-    "nyc_precincts"     : dict(lr=3e-4, epochs=200, patience=20,
-                               hidden=16, mem_dim=16, dt=0.1),
+    "chicago_beats"     : {"lr": 5e-4, "epochs": 200, "patience": 20},
+    "chicago_districts" : {"lr": 5e-4, "epochs": 200, "patience": 20},
+    "nyc_precincts"     : {"lr": 5e-4, "epochs": 400, "patience": 40},
 }
-hp          = HPARAMS[DATASET]
-EPOCHS      = hp["epochs"]
-LR          = hp["lr"]
-PATIENCE    = hp["patience"]
-HIDDEN      = hp["hidden"]
-MEM_DIM     = hp["mem_dim"]
-DT          = hp["dt"]
-LAMBDA_L    = 1e-4
-GRAD_CLIP   = 1.0
+hp       = HPARAMS[DATASET]
+EPOCHS   = hp["epochs"]
+LR       = hp["lr"]
+PATIENCE = hp["patience"]
+
+LR_L        = 5e-3
+LAMBDA_L    = 1e-3
+GRAD_CLIP   = 0.5
 TRAIN_RATIO = 0.7
 VAL_RATIO   = 0.1
-ODE_METHOD  = "euler"
-CHUNK_SIZE  = 16
-CHECKPOINT  = f"data/processed/{DATASET}_{VARIANT}_final_best.pt"
+ODE_METHOD  = "rk4"
+CHECKPOINT  = f"data/processed/{DATASET}_{VARIANT}_best.pt"
 
 CONFIGS = {
     "chicago_beats": {
@@ -71,302 +61,219 @@ CONFIGS = {
         "adj_sp" : "data/processed/nyc_precincts_adjacency_spatial.npy",
     },
 }
+
 cfg = CONFIGS[DATASET]
 
-# ─────────────────────────────────────────────────────────────────────
-# 1. DATA
-# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 1. LOAD DATA
+# ─────────────────────────────────────────────────────────────────────────────
 crime        = pd.read_csv(cfg["crime"])
 arrest       = pd.read_csv(cfg["arrest"])
 region_order = pd.read_csv(cfg["order"]).iloc[:, 0].astype(int).tolist()
 regions      = region_order
 months       = sorted(crime["month"].unique())
-N_regions    = len(regions)
+N            = len(regions)
 T            = len(months)
 
-print(f"GN-ODE  |  dataset={DATASET}  variant={VARIANT}")
-print(f"Regions={N_regions}  Months={T}  Solver=ODE")
+print(f"Regions   : {N}")
+print(f"Months    : {T}")
 
-C_all = torch.zeros(T, N_regions)
-L_all = torch.zeros(T, N_regions)
-for i, m in enumerate(months):
-    c = (crime[crime["month"] == m]
-         .set_index("region_id").reindex(regions)
-         .fillna(0)["C"].values)
-    l = (arrest[arrest["month"] == m]
-         .set_index("region_id").reindex(regions)
-         .fillna(0)["L"].values)
-    C_all[i] = torch.tensor(c, dtype=torch.float32)
-    L_all[i] = torch.tensor(l, dtype=torch.float32)
-
-print(f"C range: min={C_all.min():.4f} max={C_all.max():.4f} "
-      f"mean={C_all.mean():.4f}")
-print(f"L range: min={L_all.min():.4f} max={L_all.max():.4f} "
-      f"mean={L_all.mean():.4f}")
-
-# ─────────────────────────────────────────────────────────────────────
-# 2. ADJACENCY
-# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 2. BUILD ADJACENCY
+# ─────────────────────────────────────────────────────────────────────────────
 adj_file = cfg["adj_fc"] if VARIANT == "fc" else cfg["adj_sp"]
-if not os.path.exists(adj_file):
-    raise FileNotFoundError(f"Not found: {adj_file}")
-A_matrix = torch.tensor(np.load(adj_file), dtype=torch.float32)
-print(f"Adjacency {A_matrix.shape}  "
-      f"nonzero={(A_matrix > 0).sum().item()}")
 
-# ─────────────────────────────────────────────────────────────────────
-# 3. MODEL
-# ─────────────────────────────────────────────────────────────────────
-def build_model():
-    if VARIANT == "latent":
-        return MODEL_MAP[VARIANT](
-            A_matrix, T=T, alpha=0.3, beta=0.6,
-            hidden_dim=HIDDEN)
-    elif VARIANT == "spatial_attn":
-        return MODEL_MAP[VARIANT](
-            A_matrix, T=T, alpha=0.3, beta=0.6,
-            hidden=HIDDEN, hidden_dim=32,
-            n_heads=4)
-    else:
-        return MODEL_MAP[VARIANT](
-            A_matrix, alpha=0.3, beta=0.6,
-            hidden=HIDDEN)
-model    = build_model()
-n_params = sum(p.numel() for p in model.parameters()
-               if p.requires_grad)
-print(f"Model={model.__class__.__name__}  params={n_params:,}")
+if not os.path.exists(adj_file):
+    raise FileNotFoundError(
+        f"\nAdjacency file not found: {adj_file}"
+        f"\nBuild it first with your adjacency builder script."
+    )
+A_matrix = torch.tensor(np.load(adj_file), dtype=torch.float32)
+print(f"Adjacency : {A_matrix.shape}  nonzero={(A_matrix > 0).sum().item()}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 3. INIT MODEL
+# ─────────────────────────────────────────────────────────────────────────────
+# ── Section 3: INIT MODEL — replace the existing block ──────────────
+if VARIANT == "latent":
+    model = MODEL_MAP[VARIANT](A_matrix, T=T, alpha=0.3, beta=0.6)
+elif VARIANT == "spatial_atten":
+    model = MODEL_MAP[VARIANT](A_matrix, T=T, alpha=0.3, beta=0.6)   # T now required
+else:
+    model = MODEL_MAP[VARIANT](A_matrix, alpha=0.3, beta=0.6)
+
+print(f"Model     : {model.__class__.__name__}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4. OPTIMIZER
+# ─────────────────────────────────────────────────────────────────────────────
+if VARIANT == "latent":
+    base_params = [p for n, p in model.named_parameters()
+                   if "L_net" not in n and "node_emb" not in n]
+    lnet_params = [p for n, p in model.named_parameters()
+                   if "L_net" in n or "node_emb" in n]
+    opt = torch.optim.Adam([
+        {"params": base_params, "lr": LR},
+        {"params": lnet_params, "lr": LR_L},
+    ])
+else:
+    opt = torch.optim.Adam(model.parameters(), lr=LR)
+
+loss_fn   = nn.MSELoss()
+t_span    = torch.tensor([0.0, 1.0])
+scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+    opt, mode="min", factor=0.5, patience=10, min_lr=1e-6, verbose=False
+)
+
+print(f"Trainable params: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
 model.param_summary()
 
-# ─────────────────────────────────────────────────────────────────────
-# 4. OPTIMISER
-# ─────────────────────────────────────────────────────────────────────
-opt       = torch.optim.AdamW(model.parameters(),
-                               lr=LR, weight_decay=1e-4)
-loss_fn   = nn.HuberLoss(delta=0.3)
-t_eval    = torch.tensor([0.0, 1.0])
-scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-    opt, T_0=60, T_mult=2, eta_min=1e-6)
+# ─────────────────────────────────────────────────────────────────────────────
+# 5. HELPER
+# ─────────────────────────────────────────────────────────────────────────────
+def get_state(month):
+    C = (crime[crime["month"] == month]
+         .set_index("region_id").reindex(regions).fillna(0)["C"].values)
+    L = (arrest[arrest["month"] == month]
+         .set_index("region_id").reindex(regions).fillna(0)["L"].values)
+    return torch.tensor(C, dtype=torch.float32), torch.tensor(L, dtype=torch.float32)
 
-# ─────────────────────────────────────────────────────────────────────
-# 5. SPLIT
-# ─────────────────────────────────────────────────────────────────────
-n_train   = int(T * TRAIN_RATIO)
-n_val     = int(T * VAL_RATIO)
-train_idx = list(range(0, n_train))
-val_idx   = list(range(n_train, n_train + n_val))
-test_idx  = list(range(n_train + n_val, T))
-print(f"Split: train={len(train_idx)} "
-      f"val={len(val_idx)} test={len(test_idx)}")
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. SPLIT
+# ─────────────────────────────────────────────────────────────────────────────
+n_train      = int(T * TRAIN_RATIO)
+n_val        = int(T * VAL_RATIO)
+months_train = months[:n_train]
+months_val   = months[n_train : n_train + n_val]
+months_test  = months[n_train + n_val :]
+print(f"Split     : train={len(months_train)}  val={len(months_val)}  test={len(months_test)}")
 
-# ─────────────────────────────────────────────────────────────────────
-# 6. STEP
-# ─────────────────────────────────────────────────────────────────────
-def model_step(C0):
-    func = lambda t, C: model.ode_func(t, C)
-    C_traj = odeint(
-        func, C0, t_eval,
-        method=ODE_METHOD,
-        options={"step_size": DT},
-    )
-    C_out = C_traj[-1]
-    if VARIANT == "latent" and model._L_latent is not None:
-        model._last_L_traj = model._L_latent.detach().unsqueeze(0)
-    return C_out
+month_to_idx = {m: i for i, m in enumerate(months)}
 
-# ─────────────────────────────────────────────────────────────────────
-# 7. EPOCH
-# ─────────────────────────────────────────────────────────────────────
-def run_epoch(idx_list, train=True):
-    model.train() if train else model.eval()
+# ─────────────────────────────────────────────────────────────────────────────
+# 7. ODE WRAPPER
+# ─────────────────────────────────────────────────────────────────────────────
+def make_ode_fn(month_idx):
+    if VARIANT in ("latent", "attention"):          # both need t_idx
+        return lambda t, y: model(t, y, month_idx)
+    return model
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 8. EPOCH FUNCTION
+# ─────────────────────────────────────────────────────────────────────────────
+def run_epoch(month_list, train=True):
     if train:
+        model.train()
         opt.zero_grad()
+    else:
+        model.eval()
 
-    device = next(model.parameters()).device
-    if hasattr(model, "reset_memory"):
-        model.reset_memory(device)
-
-    total_loss       = 0.0
-    valid_steps      = 0
-    pairs            = len(idx_list) - 1
-    chunk_tensor     = None
-    chunk_step_count = 0
+    total_loss = 0.0
+    pairs      = len(month_list) - 1
 
     ctx = torch.enable_grad() if train else torch.no_grad()
     with ctx:
-        for k in range(pairs):
-            i      = idx_list[k]
-            i_next = idx_list[k + 1]
+        for i in range(pairs):
+            C0, L     = get_state(month_list[i])
+            C_true, _ = get_state(month_list[i + 1])
 
-            C0     = C_all[i]
-            L      = L_all[i]
-            C_true = C_all[i_next]
+            # set context before odeint — L and month index
+            model.set_context(L, t_idx=i)
 
-            # unified — fc/spatial ignore T safely
-            model.set_context(L, t_idx=i, T=T)
+            C_pred = odeint(
+                model,
+                C0,
+                t_span,
+                method=ODE_METHOD,
+            )[-1]
 
-            C_pred = model_step(C0)
+            total_loss += loss_fn(C_pred, C_true)
 
-            if (torch.isnan(C_pred).any() or
-                    torch.isinf(C_pred).any()):
-                if hasattr(model, "memory"):
-                    model.memory.detach()
-                if hasattr(model, "step_memory"):
-                    model.step_memory(C0, L)
-                continue
+        mean_loss = total_loss / pairs
 
-            step_loss = loss_fn(C_pred, C_true)
+        if train:
+            mean_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            opt.step()
 
-            if not math.isfinite(step_loss.item()):
-                if hasattr(model, "memory"):
-                    model.memory.detach()
-                continue
-
-            if VARIANT == "latent" and train:
-                if (hasattr(model, "_last_L_traj") and
-                        model._last_L_traj is not None):
-                    reg = model.L_regularisation_loss(
-                        model._last_L_traj)
-                    if math.isfinite(reg.item()):
-                        step_loss = step_loss + LAMBDA_L * reg
-
-            if hasattr(model, "step_memory"):
-                model.step_memory(C_pred, L)
-            if hasattr(model, "memory"):
-                model.memory.detach()
-            if hasattr(model, "memory_L"):
-                model.memory_L.detach()
-
-            chunk_tensor      = step_loss if chunk_tensor is None \
-                                else chunk_tensor + step_loss
-            chunk_step_count += 1
-
-            is_last  = (k == pairs - 1)
-            is_chunk = (chunk_step_count == CHUNK_SIZE)
-
-            if train and (is_chunk or is_last) and \
-                    chunk_tensor is not None:
-                (chunk_tensor / chunk_step_count).backward()
-                torch.nn.utils.clip_grad_norm_(
-                    model.parameters(), GRAD_CLIP)
-                opt.step()
-                opt.zero_grad()
-                cv = chunk_tensor.item()
-                if math.isfinite(cv):
-                    total_loss  += cv
-                    valid_steps += chunk_step_count
-                chunk_tensor     = None
-                chunk_step_count = 0
-
-            elif not train:
-                lv = step_loss.item()
-                if math.isfinite(lv):
-                    total_loss  += lv
-                    valid_steps += 1
-
-    if valid_steps == 0:
-        return float("nan")
-    return total_loss / valid_steps
-
-# ─────────────────────────────────────────────────────────────────────
-# 8. TRAINING LOOP
-# ─────────────────────────────────────────────────────────────────────
+    return mean_loss.item()
+# ─────────────────────────────────────────────────────────────────────────────
+# 9. TRAINING LOOP
+# ─────────────────────────────────────────────────────────────────────────────
 best_val, patience_c, history = float("inf"), 0, []
 
-print("\n" + "=" * 70)
-print(f"{'Epoch':>6}  {'Train':>12}  {'Val':>12}  "
-      f"{'LR':>12}  {'Time(s)':>8}")
-print("=" * 70)
-
-t0 = time.time()
+print("\n" + "=" * 58)
+print(f"{'Epoch':>6} {'Train':>12} {'Val':>12} {'LR':>10}")
+print("=" * 58)
 
 for epoch in range(1, EPOCHS + 1):
-    train_loss = run_epoch(train_idx, train=True)
-    val_loss   = run_epoch(val_idx,   train=False)
+    train_loss = run_epoch(months_train, train=True)
+    val_loss   = run_epoch(months_val,   train=False)
     lr_now     = opt.param_groups[0]["lr"]
-    scheduler.step(epoch)
-    history.append({"epoch": epoch,
-                    "train": train_loss,
-                    "val":   val_loss})
-
-    if epoch % 10 == 0 or epoch == 1:
-        elapsed = time.time() - t0
-        print(f"{epoch:>6}  {train_loss:>12.6f}  "
-              f"{val_loss:>12.6f}  {lr_now:>12.2e}  "
-              f"{elapsed:>8.1f}")
-        t0 = time.time()
-
-    if not math.isfinite(val_loss):
-        patience_c += 1
-    elif val_loss < best_val:
+    scheduler.step(val_loss)
+    history.append({"epoch": epoch, "train": train_loss, "val": val_loss})
+    print(f"{epoch:>6}  {train_loss:>12.6f}  {val_loss:>12.6f}  {lr_now:>10.2e}")
+    if val_loss < best_val:
         best_val, patience_c = val_loss, 0
         torch.save(model.state_dict(), CHECKPOINT)
-        print(f"         >> best val {best_val:.6f} "
-              f"— saved (epoch {epoch})")
+        print(f"         >> best val {best_val:.6f} — saved")
     else:
         patience_c += 1
+        if patience_c >= PATIENCE:
+            print(f"\nEarly stopping at epoch {epoch}")
+            break
 
-    if patience_c >= PATIENCE:
-        print(f"\nEarly stopping at epoch {epoch}")
-        break
-
-print(f"\nBest val loss: {best_val:.6f}")
+print(f"\nBest val loss : {best_val:.6f}")
 model.param_summary()
 
-# ─────────────────────────────────────────────────────────────────────
-# 9. PREDICTIONS
-# ─────────────────────────────────────────────────────────────────────
-print("\nGenerating predictions ...")
-model.load_state_dict(
-    torch.load(CHECKPOINT, weights_only=True))
+# ─────────────────────────────────────────────────────────────────────────────
+# 10. PREDICTIONS
+# ─────────────────────────────────────────────────────────────────────────────
+print("\nGenerating predictions from best checkpoint ...")
+model.load_state_dict(torch.load(CHECKPOINT, weights_only=True))
 model.eval()
 
-device = next(model.parameters()).device
-if hasattr(model, "reset_memory"):
-    model.reset_memory(device)
-
-months_set_train = {months[i] for i in train_idx}
-months_set_val   = {months[i] for i in val_idx}
+months_set_train = set(months_train)
+months_set_val   = set(months_val)
 results          = []
 
 with torch.no_grad():
     for i in range(T - 1):
-        C0 = C_all[i]
-        L  = L_all[i]
+        C0, L  = get_state(months[i])
+        t_idx  = month_to_idx[months[i]]
+        model.set_context(L, t_idx=t_idx)
+        C_pred = odeint(model, C0, t_span, method=ODE_METHOD)[-1]  # pass C0 not y0
 
-        model.set_context(L, t_idx=i, T=T)
-        C_pred = model_step(C0)
-
-        if hasattr(model, "step_memory"):
-            model.step_memory(C_pred, L)
-
-        m           = months[i + 1]
-        split_label = ("train" if m in months_set_train else
-                       "val"   if m in months_set_val   else "test")
+        m = months[i + 1]
+        split_label = (
+            "train" if m in months_set_train else
+            "val"   if m in months_set_val   else
+            "test"
+        )
         for region, value in zip(regions, C_pred.numpy()):
-            results.append({"month"    : m,
-                            "region_id": region,
-                            "C_gnode"  : float(value),
-                            "split"    : split_label})
+            results.append({
+                "month"     : m,
+                "region_id" : region,
+                "C_gnode"   : float(value),
+                "split"     : split_label,
+            })
 
 pred_df  = pd.DataFrame(results)
-out_pred = (f"data/processed/{DATASET}_{VARIANT}"
-            f"_final_predictions.csv")
+out_pred = f"data/processed/{DATASET}_{VARIANT}_predictions.csv"
 pred_df.to_csv(out_pred, index=False)
-print(f"Saved -> {out_pred}")
+print(f"Saved → {out_pred}")
 
-# ─────────────────────────────────────────────────────────────────────
-# 10. TEST METRICS
-# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 11. TEST METRICS
+# ─────────────────────────────────────────────────────────────────────────────
 test_pred          = pred_df[pred_df["split"] == "test"].copy()
 real_df            = pd.read_csv(cfg["crime"])
 real_df["month"]   = real_df["month"].astype(str)
 test_pred["month"] = test_pred["month"].astype(str)
-merged             = pd.merge(real_df, test_pred,
-                              on=["month", "region_id"],
-                              how="inner")
+merged             = pd.merge(real_df, test_pred, on=["month", "region_id"], how="inner")
 
 if merged.empty:
-    print("WARNING: merge empty.")
+    print("WARNING: merge empty — check region_id and month columns match.")
 else:
     y_true = merged["C"].values
     y_pred = merged["C_gnode"].values
@@ -374,42 +281,53 @@ else:
     rmse   = np.sqrt(mean_squared_error(y_true, y_pred))
     r2     = r2_score(y_true, y_pred)
     smape  = float(np.mean(
-        2 * np.abs(y_pred - y_true) /
-        (np.abs(y_true) + np.abs(y_pred) + 1e-8)
+        2 * np.abs(y_pred - y_true) / (np.abs(y_true) + np.abs(y_pred) + 1e-8)
     ) * 100)
-    print(f"\n===== {DATASET.upper()}  {VARIANT.upper()} "
-          f"— TEST =====")
+    print(f"\n===== {DATASET.upper()}  {VARIANT.upper()}  — TEST SET =====")
     print(f"  MAE   : {mae:.4f}")
     print(f"  RMSE  : {rmse:.4f}")
     print(f"  R2    : {r2:.4f}")
     print(f"  sMAPE : {smape:.2f}%")
-    print("=" * 48)
+    print("=" * 45)
 
-# ─────────────────────────────────────────────────────────────────────
-# 11. LATENT ENFORCEMENT ANALYSIS
-# ─────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# 12. LATENT ENFORCEMENT ANALYSIS
+# ─────────────────────────────────────────────────────────────────────────────
 if VARIANT == "latent":
-    print("\nCollecting latent enforcement schedule ...")
-    model.eval()
-    latent_rows = []
+    print("\nGenerating learned enforcement analysis ...")
+    latent_df  = model.get_learned_enforcement(regions, months)
+    out_latent = f"data/processed/{DATASET}_{VARIANT}_enforcement.csv"
+    latent_df.to_csv(out_latent, index=False)
+    print(f"Saved → {out_latent}")
+    L_values = latent_df["L_latent"].values
+    print(f"\n===== LEARNED ENFORCEMENT ANALYSIS =====")
+    print(f"  Mean : {L_values.mean():.4f}")
+    print(f"  Std  : {L_values.std():.4f}")
+    print(f"  Min  : {L_values.min():.4f}")
+    print(f"  Max  : {L_values.max():.4f}")
+    mean_by_region = (
+        latent_df.groupby("region_id")["L_latent"]
+        .mean().sort_values(ascending=False)
+    )
+    print("\n  Top 3 regions by enforcement intensity:")
+    for region, val in mean_by_region.head(3).items():
+        print(f"    Region {region}: L = {val:.4f}")
+    real_df["month"]   = real_df["month"].astype(str)
+    latent_df["month"] = latent_df["month"].astype(str)
+    check = pd.merge(real_df, latent_df, on=["region_id", "month"], how="inner")
+    corr  = check[["C", "L_latent"]].corr().iloc[0, 1]
+    print(f"\n  Correlation of learned L with crime C : {corr:.4f}")
+    if abs(corr) < 0.2:
+        print("  Excellent — learned L is largely orthogonal to crime")
+    elif abs(corr) < 0.4:
+        print("  Acceptable — some correlation but model is disentangling signals")
+    else:
+        print("  High — consider increasing LAMBDA_L regularisation")
+    print("=" * 45)
 
-    with torch.no_grad():
-        for i in range(T - 1):
-            C0 = C_all[i]
-            L  = L_all[i]
-            model.set_context(L, t_idx=i, T=T)
-            C_out = model_step(C0)
-            L_new = model.update_L(C_out)
-            for j, region in enumerate(regions):
-                latent_rows.append({
-                    "month"    : months[i + 1],
-                    "region_id": region,
-                    "L_latent" : float(L_new[j].item()),
-                })
-# ─────────────────────────────────────────────────────────────────────
-# 12. HISTORY
-# ─────────────────────────────────────────────────────────────────────
-out_hist = (f"data/processed/{DATASET}_{VARIANT}"
-            f"_final_history.csv")
+# ─────────────────────────────────────────────────────────────────────────────
+# 13. SAVE TRAINING HISTORY
+# ─────────────────────────────────────────────────────────────────────────────
+out_hist = f"data/processed/{DATASET}_{VARIANT}_training_history.csv"
 pd.DataFrame(history).to_csv(out_hist, index=False)
-print(f"History -> {out_hist}")
+print(f"History → {out_hist}")

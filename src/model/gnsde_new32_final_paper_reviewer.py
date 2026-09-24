@@ -1,30 +1,10 @@
 """
 GN-SDE: Graph Neural Stochastic Differential Equations for Crime Forecasting
-Four variants with strictly increasing expressiveness.
-
-Hierarchy guaranteed by INDUCTIVE BIAS, not parameter count.
-
-Drift matches paper equations exactly:
-  fc      (15): f = C(1-C)[alpha + Phi([AC,h])] - beta*L*C
-  spatial (18): f = C(1-C)[alpha + Phi(phi_sp)] + rho*grad1 - beta*L*C
-  attn    (21): f = C(1-C)[alpha + Phi(phi_sp)] + rho*grad1 - beta*m_beta*L*C
-  latent  (25): f = C(1-C)[alpha + Psi(phi_C)]  - beta*L_lat*C   (no rho)
-
---------------------------------------------------------------------
-NOISE ABLATION : every class
-accepts a `diffusion_type` constructor argument.
-
-  diffusion_type="boundary_vanishing" (default, unchanged behaviour):
-      g_i(C_i) = sigma_i * C_i * (1 - C_i)
-      Vanishes exactly at C_i in {0,1}; this is what Theorem 4.3's
-      almost-sure invariance proof relies on.
-
-  diffusion_type="constant" (ablation only):
-      g_i(C_i) = sigma_i   (state-independent, does NOT vanish at the
-      boundary). Requires post-hoc clipping of C(t) in train_gnsde.py's
-      model_step / model_step_mc since the invariance guarantee no
-      longer applies.
-
+Matches paper equations exactly:
+  fc:      eq (15)  f = C(1-C)[alpha + Phi([AC,h])] - beta*L*C
+  spatial: eq (18)  f = C(1-C)[alpha + Phi(phi_sp)] + rho*grad1 - beta*L*C
+  attn:    eq (21)  f = C(1-C)[alpha + Phi(phi_sp)] + rho*grad1 - beta*m_beta*L*C
+  latent:  eq (25)  f = C(1-C)[alpha + Psi(phi_C)] - beta*L_lat*C   (no rho term)
 """
 
 import math
@@ -117,20 +97,11 @@ class GNSDEfc(_BaseSDE):
     """
     f_fc_i = C_i(1-C_i)[alpha_i + Phi([(AC)_i, h_i])] - beta_i L_i(t) C_i
     Phi: single-hidden-layer Tanh MLP, input dim = 1 + mem_dim.
-
-    NOTE (noise ablation): pass diffusion_type="constant" for the
-    ablation in Reviewer 2 point 5ii. Default "boundary_vanishing"
-    reproduces original behaviour bit-for-bit.
     """
 
     def __init__(self, A, alpha=0.3, beta=0.6,
-                 hidden=32, mem_dim=16, dropout=0.1,
-                 diffusion_type: str = "boundary_vanishing"):
+                 hidden=32, mem_dim=16, dropout=0.1):
         super().__init__()
-        assert diffusion_type in ("boundary_vanishing", "constant"), \
-            f"diffusion_type must be 'boundary_vanishing' or 'constant', got {diffusion_type!r}"
-        self.diffusion_type = diffusion_type
-
         A_t    = _safe_A(A)
         A_norm = _row_normalise(A_t)
         self.register_buffer("A", A_norm)
@@ -178,12 +149,6 @@ class GNSDEfc(_BaseSDE):
 
     def g(self, t, C):
         C = C.view(-1).clamp(0.0, 1.0)
-        if self.diffusion_type == "constant":
-            # Ablation: state-independent noise, does NOT vanish at C=0,1.
-            # Requires post-hoc clipping of C(t) in the SDE step (see
-            # train_gnsde.py model_step / model_step_mc) since Theorem
-            # 4.3's invariance proof no longer applies to this variant.
-            return self.sigma.unsqueeze(0).expand(1, self.N)
         return (self.sigma * C * (1 - C)).unsqueeze(0)
 
     def step_memory(self, C, L=None):
@@ -201,7 +166,6 @@ class GNSDEfc(_BaseSDE):
         ps = torch.exp(self.log_sigma_pred).detach()
         print(f"[GNSDEfc]  alpha:{a.mean():.4f}  beta:{b.mean():.4f}  "
               f"sigma:{s.mean():.4f}  sigma_pred:{ps.mean():.4f}")
-        print(f"[GNSDEfc]  diffusion_type: {self.diffusion_type}")
         print(f"[GNSDEfc]  drift: C(1-C)[alpha+Phi([AC,h])] - beta*L*C  (eq 15)")
 
 
@@ -214,20 +178,11 @@ class GNSDEspatial(_BaseSDE):
     f_sp_i = C_i(1-C_i)[alpha_i + Phi(phi_sp_i)] + rho*grad1_i - beta_i L_i(t) C_i
     phi_sp = [C, (Asp C), (A2 C), grad_feats(3, layernormed), h] in R^{6+mem_dim}
     Phi: two-hidden-layer Tanh MLP. rho = 0.1*sigmoid(raw_rho) in [0,0.1].
-
-    NOTE (noise ablation): pass diffusion_type="constant" for the
-    ablation in Reviewer 2 point 5ii. Default "boundary_vanishing"
-    reproduces original behaviour bit-for-bit.
     """
 
     def __init__(self, A, alpha=0.3, beta=0.6,
-                 hidden=32, mem_dim=16, dropout=0.1,
-                 diffusion_type: str = "boundary_vanishing"):
+                 hidden=32, mem_dim=16, dropout=0.1):
         super().__init__()
-        assert diffusion_type in ("boundary_vanishing", "constant"), \
-            f"diffusion_type must be 'boundary_vanishing' or 'constant', got {diffusion_type!r}"
-        self.diffusion_type = diffusion_type
-
         A_t = _safe_A(A)
         A_t.fill_diagonal_(0.0)
         A_norm = _row_normalise(A_t)
@@ -300,8 +255,6 @@ class GNSDEspatial(_BaseSDE):
 
     def g(self, t, C):
         C = C.view(-1).clamp(0.0, 1.0)
-        if self.diffusion_type == "constant":
-            return self.sigma.unsqueeze(0).expand(1, self.N)
         return (self.sigma * C * (1 - C)).unsqueeze(0)
 
     def step_memory(self, C, L=None):
@@ -320,9 +273,6 @@ class GNSDEspatial(_BaseSDE):
         rh = self.rho.detach().item()
         print(f"[GNSDEspatial]  alpha:{a.mean():.4f}  beta:{b.mean():.4f}  "
               f"sigma:{s.mean():.4f}  sigma_pred:{ps.mean():.4f}  rho:{rh:.4f}")
-        print(f"[GNSDEspatial]  diffusion_type: {self.diffusion_type}")
-        print(f"[GNSDEspatial]  edges 1-hop:{(self.A>0).sum().item()}  "
-              f"2-hop:{(self.A2>0).sum().item()}")
         print(f"[GNSDEspatial]  drift: C(1-C)[alpha+Phi(phi_sp)] + rho*grad1 - beta*L*C  (eq 18)")
 
 
@@ -334,22 +284,13 @@ class GNSDEspatial_attention(_BaseSDE):
     """
     f_att_i = C_i(1-C_i)[alpha_i + Phi(phi_sp_i)] + rho*grad1_i
               - beta_i * m_beta,i * L_i(t) * C_i
-    phi_sp identical to GNSDEspatial. m_beta via cross-region attention.
-
-    NOTE (noise ablation): pass diffusion_type="constant" for the
-    ablation in Reviewer 2 point 5ii. Default "boundary_vanishing"
-    reproduces original behaviour bit-for-bit.
+    phi_sp identical to GNSDEspatial. m_beta via cross-region attention (eq 19-20).
     """
 
     def __init__(self, A, T=1, hidden=32, hidden_dim=64,
                  alpha=0.3, beta=0.6, n_heads=4,
-                 mem_dim=16, dropout=0.1,
-                 diffusion_type: str = "boundary_vanishing"):
+                 mem_dim=16, dropout=0.1):
         super().__init__()
-        assert diffusion_type in ("boundary_vanishing", "constant"), \
-            f"diffusion_type must be 'boundary_vanishing' or 'constant', got {diffusion_type!r}"
-        self.diffusion_type = diffusion_type
-
         A_t = _safe_A(A)
 
         A_sp = A_t.clone()
@@ -411,7 +352,7 @@ class GNSDEspatial_attention(_BaseSDE):
     @property
     def sigma(self): return torch.sigmoid(self.raw_sigma) * 0.48 + 0.02
     @property
-    def rho(self):   return torch.sigmoid(self.raw_rho) * 0.1
+    def rho(self):   return torch.sigmoid(self.raw_rho) * 0.1   # matches [0,0.1] as in spatial
 
     def set_context(self, L, t_idx=0, T=None):
         if T is not None:
@@ -464,8 +405,6 @@ class GNSDEspatial_attention(_BaseSDE):
 
     def g(self, t, C):
         C = C.view(-1).clamp(0.0, 1.0)
-        if self.diffusion_type == "constant":
-            return self.sigma.unsqueeze(0).expand(1, self.N)
         return (self.sigma * C * (1 - C)).unsqueeze(0)
 
     def step_memory(self, C, L=None):
@@ -484,7 +423,6 @@ class GNSDEspatial_attention(_BaseSDE):
         rh = self.rho.detach().item()
         print(f"[GNSDEattn]  alpha:{a.mean():.4f}  beta:{b.mean():.4f}  "
               f"sigma:{s.mean():.4f}  sigma_pred:{ps.mean():.4f}  rho:{rh:.4f}")
-        print(f"[GNSDEattn]  diffusion_type: {self.diffusion_type}")
         print(f"[GNSDEattn]  drift: C(1-C)[alpha+Phi(phi_sp)] + rho*grad1 "
               f"- beta*m_beta*L*C  (eq 21)")
 
@@ -503,27 +441,20 @@ class GNSDElatent(_BaseSDE):
     Crime drift (24)-(25):
       phi_C = [C,(AspC),(A2C),Llat,(AspLlat),dC,dL,sin,cos,h_C] in R^{9+dm}
       f_lat_i = C_i(1-C_i)[alpha_i + Psi(phi_C_i)] - beta_i*Llat_i*C_i
-      (no explicit rho term — matches eq 25 exactly)
-
-    NOTE (noise ablation): pass diffusion_type="constant" for the
-    ablation in Reviewer 2 point 5ii. Default "boundary_vanishing"
-    reproduces original behaviour bit-for-bit.
+      (NOTE: no explicit rho term in latent — matches eq 25 exactly)
 
     L_supervision_loss() is an AUXILIARY TRAINING LOSS, not part of the
-    drift f() or eq (22)-(25). It gives the enforcement network a
-    direct, C-independent gradient path (Huber(L_lat, L_obs)) so it
-    keeps learning on region-months where C(1-C) vanishes.
+    drift f() or the theorem. It gives the enforcement network a direct,
+    C-independent gradient path (Huber(L_lat, L_obs)) so it keeps
+    learning on region-months where C(1-C) vanishes. It does not modify
+    equations (22)-(25) in any way.
     """
 
     def __init__(self, A, T: int,
                  alpha=0.3, beta=0.6,
                  hidden_dim=32, mem_dim=16,
-                 dropout=0.1,
-                 diffusion_type: str = "boundary_vanishing"):
+                 dropout=0.1):
         super().__init__()
-        assert diffusion_type in ("boundary_vanishing", "constant"), \
-            f"diffusion_type must be 'boundary_vanishing' or 'constant', got {diffusion_type!r}"
-        self.diffusion_type = diffusion_type
 
         A_t = _safe_A(A)
         A_t.fill_diagonal_(0.0)
@@ -582,7 +513,7 @@ class GNSDElatent(_BaseSDE):
         self._L_latent    : Optional[torch.Tensor] = None
         self._last_L_traj : Optional[torch.Tensor] = None
 
-        self._huber_L = nn.HuberLoss(delta=0.1)   # for L_supervision_loss only
+        self._huber_L = nn.HuberLoss(delta=0.1)   # for auxiliary loss only
 
     @property
     def alpha(self):    return torch.sigmoid(self.raw_alpha)
@@ -667,9 +598,6 @@ class GNSDElatent(_BaseSDE):
 
     def g(self, t, C):
         C = C.view(-1).clamp(0.0, 1.0)
-        if self.diffusion_type == "constant":
-            return torch.nan_to_num(
-                self.sigma.unsqueeze(0).expand(1, self.N), nan=0.0)
         return torch.nan_to_num(
             (self.sigma * C * (1 - C)).unsqueeze(0), nan=0.0)
 
@@ -739,7 +667,6 @@ class GNSDElatent(_BaseSDE):
         print(f"[GNSDElatent]  alpha:{a.mean():.4f}  beta:{b.mean():.4f}  "
               f"sigma:{s.mean():.4f}  sigma_pred:{ps.mean():.4f}  "
               f"obs_gate:{og.mean():.4f}")
-        print(f"[GNSDElatent]  diffusion_type: {self.diffusion_type}")
         print(f"[GNSDElatent]  drift: C(1-C)[alpha+Psi(phi_C)] - beta*Llat*C  (eq 25)")
         if self._L_latent is not None:
             L = self._L_latent.detach()

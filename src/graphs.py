@@ -4,16 +4,6 @@ visualize_fc_gnode.py
 
 Visualization for Fully Connected GN-ODE predictions.
 
-Fixes included:
-  1. Uses region_id instead of District
-  2. Safe merge on month
-  3. Burn-in applied AFTER merge
-  4. Timestamp normalization
-  5. Debug prints added
-  6. Handles empty merge safely
-
-Run from project root:
-    python src/visualize_fc_gnode.py
 """
 
 import pandas as pd

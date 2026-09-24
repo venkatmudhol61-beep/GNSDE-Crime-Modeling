@@ -9,15 +9,23 @@ import torchsde
 from sklearn.metrics import (mean_absolute_error,
                              mean_squared_error, r2_score)
 from model.gnsde_new32_final_paper import MODEL_MAP
+from kappa_diagnostics_reviewer import KappaLogger
+from runtime_benchmark_reviewer import count_params, time_one_epoch, log_runtime_row
 import time
 
 torch.set_num_threads(os.cpu_count())
 torch.set_float32_matmul_precision("high")
 os.environ["OMP_NUM_THREADS"] = str(os.cpu_count())
 # ─── CHANGE THESE 2 LINES ────────────────────────────────────────────
-DATASET = "chicago_beats"  
-VARIANT = "latent"
+DATASET = "chicago_beats"
+VARIANT = "fc"
 # ─────────────────────────────────────────────────────────────────────
+# Noise ablation (Reviewer 2, points 5ii and 8): "boundary_vanishing" is
+# the original/default behaviour (sigma_i * C_i * (1-C_i)), reproducing
+# all existing results bit-for-bit. Set to "constant" only to run the
+# ablation (sigma_i alone, requires post-hoc clipping -- see model_step
+# / model_step_mc below).
+NOISE_TYPE = "boundary_vanishing"
 torch.manual_seed(42)
 np.random.seed(42)
 
@@ -63,12 +71,14 @@ PATIENCE      = vhp["patience"]
 HUBER_W       = vhp["huber_w"]
 NLL_W         = vhp["nll_w"]
 LAMBDA_L      = 1e-4
+LAMBDA_LSUP   = 0.3     # weight for L_supervision_loss (latent only)
 GRAD_CLIP     = 1.0
 TRAIN_RATIO   = 0.7
 VAL_RATIO     = 0.1
 SDE_METHOD    = "euler"
 CHUNK_SIZE    = 16
-CHECKPOINT    = f"data/processed/{DATASET}_{VARIANT}_final_best.pt"
+_ckpt_suffix  = "" if NOISE_TYPE == "boundary_vanishing" else "_constnoise"
+CHECKPOINT    = f"data/processed/{DATASET}_{VARIANT}{_ckpt_suffix}_final_best.pt"
 
 DT_MC        = 0.02
 T_EVAL_TRAIN = torch.tensor([0.0, 1.0])
@@ -144,22 +154,25 @@ def build_model():
     if VARIANT == "latent":
         return MODEL_MAP[VARIANT](
             A_matrix, T=T, alpha=0.3, beta=0.6,
-            hidden_dim=HIDDEN, mem_dim=MEM_DIM)
+            hidden_dim=HIDDEN, mem_dim=MEM_DIM, diffusion_type=NOISE_TYPE)
     elif VARIANT == "spatial_attn":
         return MODEL_MAP[VARIANT](
             A_matrix, T=T, alpha=0.3, beta=0.6,
             hidden=HIDDEN, hidden_dim=HIDDEN * 2,
-            n_heads=4, mem_dim=MEM_DIM)
+            n_heads=4, mem_dim=MEM_DIM, diffusion_type=NOISE_TYPE)
     else:
         return MODEL_MAP[VARIANT](
             A_matrix, alpha=0.3, beta=0.6,
-            hidden=HIDDEN, mem_dim=MEM_DIM)
+            hidden=HIDDEN, mem_dim=MEM_DIM, diffusion_type=NOISE_TYPE)
 
 model    = build_model()
 n_params = sum(p.numel() for p in model.parameters()
                if p.requires_grad)
 print(f"Model={model.__class__.__name__}  params={n_params:,}")
 model.param_summary()
+
+# runtime benchmark: parameter count (Reviewer 2, point 10)
+n_params_bench = count_params(model)
 
 # ─────────────────────────────────────────────────────────────────────
 # 4. LOSSES
@@ -177,6 +190,15 @@ val_idx   = list(range(n_train, n_train + n_val))
 test_idx  = list(range(n_train + n_val, T))
 print(f"Split: train={len(train_idx)} val={len(val_idx)} test={len(test_idx)}")
 
+# ── kappa (stability margin) diagnostic logger ─────────────────────
+# Addresses Reviewer 2, point 2: logs alpha_i/beta_i/sigma_i -> kappa_i
+# every epoch, plus the fraction of epochs where kappa_min <= 0.
+kappa_logger = KappaLogger(
+    n_nodes=N_regions,
+    out_csv=f"data/processed/{DATASET}_{VARIANT}{_ckpt_suffix}_kappa_log.csv",
+)
+L_bar_i = L_all[train_idx].mean(dim=0).cpu().numpy()   # shape (N_regions,)
+
 # ─────────────────────────────────────────────────────────────────────
 # 6. STEP FUNCTIONS
 # ─────────────────────────────────────────────────────────────────────
@@ -185,6 +207,12 @@ def model_step(C0):
         model, C0.unsqueeze(0), T_EVAL_TRAIN,
         method=SDE_METHOD, dt=DT,
     )[-1, 0]
+    if getattr(model, "diffusion_type", "boundary_vanishing") == "constant":
+        # Constant noise does not vanish at the boundary, so C(t) can
+        # leave [0,1] during solver steps; clip here to keep training
+        # stable. Boundary-vanishing noise never needs this (Theorem
+        # 4.3 already guarantees invariance for it).
+        C_out = C_out.clamp(0.0, 1.0)
     if VARIANT == "latent" and model._L_latent is not None:
         model._last_L_traj = model._L_latent.detach().unsqueeze(0)
     return C_out
@@ -194,6 +222,8 @@ def model_step_mc(C0):
         model, C0.unsqueeze(0), T_EVAL_MC,
         method=SDE_METHOD, dt=DT_MC,
     )[-1, 0]
+    if getattr(model, "diffusion_type", "boundary_vanishing") == "constant":
+        C_out = C_out.clamp(0.0, 1.0)
     if VARIANT == "latent" and model._L_latent is not None:
         model._last_L_traj = model._L_latent.detach().unsqueeze(0)
     return C_out
@@ -256,6 +286,13 @@ def run_epoch(idx_list, train=True, phase=1):
                     if math.isfinite(reg.item()):
                         step_loss = step_loss + LAMBDA_L * reg
 
+                # Direct, C-independent supervision for L_lat — gives
+                # node_emb/L_net/L_gate/obs_gate a gradient on every
+                # region-month regardless of C(1-C) vanishing at C=0.
+                l_sup = model.L_supervision_loss()
+                if math.isfinite(l_sup.item()):
+                    step_loss = step_loss + LAMBDA_LSUP * l_sup
+
             if hasattr(model, "step_memory"):
                 model.step_memory(C_pred, L)
             if hasattr(model, "memory"):
@@ -313,6 +350,7 @@ print(f"{'Epoch':>6}  {'Train':>12}  {'Val':>12}  {'LR':>12}  "
       f"{'sigma_pred':>12}  {'Time(s)':>8}")
 print("=" * 75)
 
+_phase1_wall_t0 = time.time()          # total Phase 1 wall-clock
 t0 = time.time()
 for epoch in range(1, EPOCHS_PHASE1 + 1):
     train_loss = run_epoch(train_idx, train=True,  phase=1)
@@ -323,6 +361,13 @@ for epoch in range(1, EPOCHS_PHASE1 + 1):
     history.append({"epoch": epoch, "phase": 1,
                     "train": train_loss, "val": val_loss,
                     "sigma_pred": sp})
+    kappa_logger.log_epoch(
+        epoch,
+        alpha_i=model.alpha.detach().cpu().numpy(),
+        beta_i=model.beta.detach().cpu().numpy(),
+        sigma_i=model.sigma.detach().cpu().numpy(),
+        L_bar_i=L_bar_i,
+    )
 
     if epoch % 10 == 0 or epoch == 1:
         elapsed = time.time() - t0
@@ -344,6 +389,24 @@ for epoch in range(1, EPOCHS_PHASE1 + 1):
         break
 
 print(f"\nPhase 1 best val: {best_val:.6f}")
+_phase1_wall_time = time.time() - _phase1_wall_t0
+print(f"Phase 1 total wall-clock: {_phase1_wall_time:.1f}s")
+
+# runtime benchmark: seconds/epoch, timed on the real training step
+# (Reviewer 2, point 10). IMPORTANT: this runs real extra training epochs
+# purely to measure wall-clock time; without saving/restoring the RNG
+# state, those epochs would consume draws from torch's global RNG (used
+# internally by torchsde.sdeint's Brownian motion sampling), silently
+# shifting the noise realizations seen by Phase 2 below and making runs
+# with/without this benchmark call diverge slightly. Saving and restoring
+# the RNG state here keeps the benchmark side-effect-free.
+_rng_state_cpu = torch.get_rng_state()
+epoch_time = time_one_epoch(
+    step_fn=lambda: run_epoch(train_idx, train=True, phase=1),
+    n_warmup=1, n_measured=3,
+)
+torch.set_rng_state(_rng_state_cpu)
+print(f"Benchmark: {epoch_time:.4f} sec/epoch (Phase 1 training step)")
 
 # ─────────────────────────────────────────────────────────────────────
 # 9. PHASE 2 — Huber + NLL, sigma_pred calibrates at full LR
@@ -373,6 +436,7 @@ print(f"{'Epoch':>6}  {'Train':>12}  {'Val':>12}  {'LR_sigma':>12}  "
       f"{'sigma_pred':>12}  {'Time(s)':>8}")
 print("=" * 75)
 
+_phase2_wall_t0 = time.time()          # total Phase 2 wall-clock
 t0 = time.time()
 for epoch in range(1, EPOCHS_PHASE2 + 1):
     train_loss = run_epoch(train_idx, train=True,  phase=2)
@@ -383,6 +447,13 @@ for epoch in range(1, EPOCHS_PHASE2 + 1):
     history.append({"epoch": EPOCHS_PHASE1 + epoch, "phase": 2,
                     "train": train_loss, "val": val_loss,
                     "sigma_pred": sp})
+    kappa_logger.log_epoch(
+        EPOCHS_PHASE1 + epoch,
+        alpha_i=model.alpha.detach().cpu().numpy(),
+        beta_i=model.beta.detach().cpu().numpy(),
+        sigma_i=model.sigma.detach().cpu().numpy(),
+        L_bar_i=L_bar_i,
+    )
 
     if epoch % 10 == 0 or epoch == 1:
         elapsed = time.time() - t0
@@ -404,8 +475,14 @@ for epoch in range(1, EPOCHS_PHASE2 + 1):
         break
 
 print(f"\nPhase 2 best val: {best_val2:.6f}")
+_phase2_wall_time = time.time() - _phase2_wall_t0
+print(f"Phase 2 total wall-clock: {_phase2_wall_time:.1f}s")
+
 model.load_state_dict(torch.load(CHECKPOINT, weights_only=True))
 model.param_summary()
+
+# ── finalize kappa log: writes per-epoch CSV + prints convergence summary
+kappa_logger.finalize()
 
 # ─────────────────────────────────────────────────────────────────────
 # 10. MC INFERENCE
@@ -416,6 +493,10 @@ device = next(model.parameters()).device
 
 months_set_train = {months[i] for i in train_idx}
 months_set_val   = {months[i] for i in val_idx}
+
+# runtime benchmark: wall-clock for the full N_MC=100 inference pass
+# (Reviewer 2, point 10)
+_inference_t0 = time.time()
 
 all_samples = []
 for s in range(N_SAMPLES):
@@ -434,6 +515,9 @@ for s in range(N_SAMPLES):
                 model.step_memory(C_pred, L)
             sample_preds.append(C_pred.cpu())
     all_samples.append(torch.stack(sample_preds))
+
+_inference_time = time.time() - _inference_t0
+print(f"Benchmark: {_inference_time:.4f} sec for full N_MC={N_SAMPLES} inference pass")
 
 samples_tensor = torch.stack(all_samples)
 pred_mean      = samples_tensor.mean(0)
@@ -478,7 +562,8 @@ for i in range(T - 1):
         })
 
 pred_df  = pd.DataFrame(results)
-out_pred = f"data/processed/{DATASET}_{VARIANT}_final_predictions.csv"
+_suffix  = "" if NOISE_TYPE == "boundary_vanishing" else "_constnoise"
+out_pred = f"data/processed/{DATASET}_{VARIANT}{_suffix}_final_predictions.csv"
 pred_df.to_csv(out_pred, index=False)
 print(f"Saved predictions -> {out_pred}")
 
@@ -717,7 +802,21 @@ print("\n===== END DIAGNOSTICS =====")
 # ─────────────────────────────────────────────────────────────────────
 # 14. HISTORY
 # ─────────────────────────────────────────────────────────────────────
-out_hist = f"data/processed/{DATASET}_{VARIANT}_final_history.csv"
+out_hist = f"data/processed/{DATASET}_{VARIANT}{_suffix}_final_history.csv"
 pd.DataFrame(history).to_csv(out_hist, index=False)
 print(f"History -> {out_hist}")
+
+# Total wall-clock across both training phases + full MC inference
+# (Reviewer 2, point 10 -- this is the number that belongs in the
+# manuscript's computational-overhead table for this GN-SDE variant).
+_total_wall_clock = _phase1_wall_time + _phase2_wall_time + _inference_time
+print(f"\nTOTAL WALL-CLOCK (train+infer): {_total_wall_clock:.1f}s")
+
+# runtime benchmark: write the summary row (Reviewer 2, point 10)
+log_runtime_row(
+    dataset=DATASET, variant=f"{VARIANT}{_suffix}",
+    n_params=n_params_bench, epoch_time=epoch_time, inference_time=_inference_time,
+    out_csv="data/processed/runtime_summary.csv",
+)
+
 print("\nDone.")
