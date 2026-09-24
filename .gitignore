@@ -7,5 +7,3 @@ figures/
 ablation/ablation_copy
 src/model/gnsde_new32_final_paper_reviewer
 src/train_gnsde_reviewer.py
-ablation/correlated_noise_ablation.py
-ablation/correlated_noise_ablation.py
